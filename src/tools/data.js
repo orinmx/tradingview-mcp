@@ -3,11 +3,13 @@ import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
 
 export function registerDataTools(server) {
-  server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context).', {
+  server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context). Use from/to unix timestamps to fetch a specific historical time range (requires chart to have that data loaded).', {
     count: z.coerce.number().optional().describe('Number of bars to retrieve (max 500, default 100)'),
     summary: z.coerce.boolean().optional().describe('Return summary stats (high, low, open, close, avg volume, range) instead of all bars — much smaller output'),
-  }, async ({ count, summary }) => {
-    try { return jsonResult(await core.getOhlcv({ count, summary })); }
+    from: z.coerce.number().optional().describe('Start unix timestamp (seconds) — only return bars at or after this time'),
+    to: z.coerce.number().optional().describe('End unix timestamp (seconds) — only return bars at or before this time'),
+  }, async ({ count, summary, from, to }) => {
+    try { return jsonResult(await core.getOhlcv({ count, summary, from, to })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
@@ -81,6 +83,15 @@ export function registerDataTools(server) {
 
   server.tool('data_get_study_values', 'Get current indicator values from the data window for all visible studies (RSI, MACD, Bollinger Bands, EMAs, custom indicators with plot()).', {}, async () => {
     try { return jsonResult(await core.getStudyValues()); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('data_load_historical', 'Trigger TradingView to load historical bars back to a target date. Uses pointer drag simulation to force the chart to fetch older data from the server. Call this before data_get_ohlcv with from/to timestamps for dates not yet in memory. Check reached=true to confirm success.', {
+    target_from: z.coerce.number().describe('Target unix timestamp (seconds) — load bars at least this far back in time'),
+    max_attempts: z.coerce.number().optional().describe('Max scroll attempts (default 20). Each attempt loads ~500 bars.'),
+    timeout_ms: z.coerce.number().optional().describe('Total timeout in milliseconds (default 30000)'),
+  }, async ({ target_from, max_attempts, timeout_ms }) => {
+    try { return jsonResult(await core.loadHistorical({ target_from, max_attempts, timeout_ms })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 }

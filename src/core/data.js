@@ -59,8 +59,10 @@ function buildGraphicsJS(collectionName, mapKey, filter) {
   `;
 }
 
-export async function getOhlcv({ count, summary } = {}) {
+export async function getOhlcv({ count, summary, from, to } = {}) {
   const limit = Math.min(count || 100, MAX_OHLCV_BARS);
+  const fromTs = from ? Number(from) : null;
+  const toTs = to ? Number(to) : null;
   let data;
   try {
     data = await evaluate(`
@@ -68,11 +70,25 @@ export async function getOhlcv({ count, summary } = {}) {
         var bars = ${BARS_PATH};
         if (!bars || typeof bars.lastIndex !== 'function') return null;
         var result = [];
+        var fromTs = ${fromTs !== null ? fromTs : 'null'};
+        var toTs = ${toTs !== null ? toTs : 'null'};
         var end = bars.lastIndex();
-        var start = Math.max(bars.firstIndex(), end - ${limit} + 1);
-        for (var i = start; i <= end; i++) {
-          var v = bars.valueAt(i);
-          if (v) result.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
+        var first = bars.firstIndex();
+        if (fromTs !== null || toTs !== null) {
+          for (var i = first; i <= end; i++) {
+            var v = bars.valueAt(i);
+            if (!v) continue;
+            if (fromTs !== null && v[0] < fromTs) continue;
+            if (toTs !== null && v[0] > toTs) continue;
+            result.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
+            if (result.length >= ${limit}) break;
+          }
+        } else {
+          var start = Math.max(first, end - ${limit} + 1);
+          for (var i = start; i <= end; i++) {
+            var v = bars.valueAt(i);
+            if (v) result.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
+          }
         }
         return {bars: result, total_bars: bars.size(), source: 'direct_bars'};
       })()
@@ -427,6 +443,106 @@ export async function getPineTables({ study_filter } = {}) {
     return { name: s.name, tables: tableList };
   });
   return { success: true, study_count: studies.length, studies };
+}
+
+export async function loadHistorical({ target_from, max_attempts = 20, timeout_ms = 30000 } = {}) {
+  if (!target_from) throw new Error('target_from (unix timestamp seconds) is required');
+  const targetTs = Number(target_from);
+
+  const checkLoaded = async () => {
+    try {
+      return await evaluate(`
+        (function() {
+          var bars = ${BARS_PATH};
+          if (!bars || typeof bars.firstIndex !== 'function') return { ready: false, reason: 'bars_unavailable' };
+          var firstIdx = bars.firstIndex();
+          var lastIdx = bars.lastIndex();
+          var firstBar = bars.valueAt(firstIdx);
+          var firstTime = firstBar ? firstBar[0] : null;
+          var isLoading = false;
+          try {
+            var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+            var model = chart.model();
+            var series = model.mainSeries();
+            isLoading = typeof series.isLoading === 'function' ? series.isLoading() : false;
+          } catch(e) {}
+          return { ready: firstTime !== null && firstTime <= ${targetTs}, firstTime: firstTime, isLoading: isLoading, barCount: lastIdx - firstIdx + 1 };
+        })()
+      `);
+    } catch { return { ready: false, reason: 'evaluate_error' }; }
+  };
+
+  const triggerLoad = async () => {
+    await evaluate(`
+      (function() {
+        var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+        var model = chart.model();
+        var ts = model.timeScale();
+        var bars = model.mainSeries().bars();
+        var firstIdx = bars.firstIndex();
+        var lastIdx = bars.lastIndex();
+        ts.zoomToBarsRange(firstIdx - 500, lastIdx + 50);
+      })()
+    `);
+    await new Promise(r => setTimeout(r, 100));
+    await evaluateAsync(`
+      (function() {
+        return new Promise(function(resolve) {
+          var pane = document.querySelector('.chart-markup-table');
+          if (!pane) { resolve(); return; }
+          var rect = pane.getBoundingClientRect();
+          var cx = rect.left + rect.width / 2;
+          var cy = rect.top + rect.height / 2;
+          var opts = { bubbles: true, button: 0, buttons: 1, pointerId: 1 };
+          pane.dispatchEvent(new PointerEvent('pointerdown', Object.assign({}, opts, { clientX: cx + 2000, clientY: cy })));
+          var moves = 30;
+          var step = 0;
+          var iv = setInterval(function() {
+            step++;
+            var x = cx + 2000 - (step * 150);
+            pane.dispatchEvent(new PointerEvent('pointermove', Object.assign({}, opts, { clientX: x, clientY: cy })));
+            if (step >= moves) {
+              clearInterval(iv);
+              pane.dispatchEvent(new PointerEvent('pointerup', Object.assign({}, opts, { clientX: cx + 2000 - moves * 150, clientY: cy })));
+              resolve();
+            }
+          }, 16);
+        });
+      })()
+    `);
+  };
+
+  const waitForIdle = async (maxWait = 8000) => {
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+      const state = await checkLoaded();
+      if (!state.isLoading) return state;
+      await new Promise(r => setTimeout(r, 300));
+    }
+    return await checkLoaded();
+  };
+
+  const start = Date.now();
+  let attempts = 0;
+
+  // Check if data is already loaded
+  let state = await waitForIdle(5000);
+  if (state.ready) {
+    return { success: true, reached: true, attempts: 0, firstTime: state.firstTime, barCount: state.barCount, message: 'Data already in memory' };
+  }
+
+  while (attempts < max_attempts && Date.now() - start < timeout_ms) {
+    attempts++;
+    await triggerLoad();
+    state = await waitForIdle(8000);
+    if (state.ready) {
+      return { success: true, reached: true, attempts, firstTime: state.firstTime, barCount: state.barCount, elapsed_ms: Date.now() - start };
+    }
+    // If still loading after wait, give it extra time
+    if (state.isLoading) await new Promise(r => setTimeout(r, 1000));
+  }
+
+  return { success: true, reached: false, attempts, firstTime: state.firstTime, barCount: state.barCount, elapsed_ms: Date.now() - start, message: `Could not reach ${targetTs} — earliest bar: ${state.firstTime}. Try more attempts or scroll back manually.` };
 }
 
 export async function getPineBoxes({ study_filter, verbose } = {}) {
